@@ -33,7 +33,7 @@ def dump_result(args, sample_id, pred_wav, suffix=""):
 
 def load_code(in_file):
     with open(in_file) as f:
-        out = [list(map(int, line.strip().split())) for line in f]
+        out = [list(map(int, line.strip().split()[:-1])) for line in f]
     return out
 
 
