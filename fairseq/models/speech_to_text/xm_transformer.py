@@ -28,6 +28,12 @@ from fairseq.modules.layer_norm import LayerNorm
 logger = logging.getLogger(__name__)
 
 
+def build_embedding(dictionary, embed_dim):
+    num_embeddings = len(dictionary)
+    padding_idx = dictionary.pad()
+    return Embedding(num_embeddings, embed_dim, padding_idx)
+
+
 class Conv1dAdaptor(nn.Module):
     def __init__(
         self,
@@ -86,6 +92,9 @@ class Conv1dAdaptor(nn.Module):
             x = x + 0.5 * self.proj(x)
             x = self.proj_ln(x)
 
+        if padding_mask is not None:
+            x = utils.index_put(x, padding_mask.T, 0)
+
         # T x B x C -> B x C x T
         x = x.transpose(0, 1).transpose(1, 2)
         out_lens = None
@@ -108,6 +117,7 @@ class Conv1dAdaptor(nn.Module):
         out_padding_mask = None
         if padding_mask is not None:
             out_padding_mask = lengths_to_padding_mask(out_lens.long())
+            x = utils.index_put(x, out_padding_mask.T, 0)
         return x, out_padding_mask
 
 
@@ -152,97 +162,88 @@ def add_wav2vec_asr_args(parser):
         metavar="D",
         help="dropout probability after activation in FFN inside wav2vec 2.0 model",
     )
-
     parser.add_argument(
         "--mask-length", type=int, help="repeat the mask indices multiple times"
     )
-
     parser.add_argument(
         "--mask-prob", type=float, help="probability of replacing a token with mask"
     )
-
     parser.add_argument(
         "--mask-selection",
         type=str,
         choices=["static", "uniform", "normal", "poisson"],
         help="how to choose masks",
     )
-
     parser.add_argument(
         "--mask-other",
         type=float,
         help="stdev of the mask length in case of 'normal' selection strategy",
     )
-
     parser.add_argument(
         "--no-mask-overlap",
         action="store_true",
         help="whether to allow masks to overlap",
     )
-
     parser.add_argument(
         "--mask-channel-length", type=int, help="repeat the mask indices multiple times"
     )
-
     parser.add_argument(
         "--mask-channel-prob",
         type=float,
         help="probability of replacing a token with mask",
     )
-
     parser.add_argument(
         "--mask-channel-selection",
         type=str,
         choices=["static", "uniform", "normal", "poisson"],
         help="how to choose masks",
     )
-
     parser.add_argument(
         "--mask-channel-other",
         type=float,
         help="stdev of the mask length in case of 'normal' selection strategy",
     )
-
     parser.add_argument(
         "--no-mask-channel-overlap",
         action="store_true",
         help="whether to allow masks to overlap",
     )
-
     parser.add_argument(
         "--freeze-finetune-updates",
-        default=0,
         type=int,
+        metavar="N",
         help="dont finetune wav2vec for this many updates",
     )
-
     parser.add_argument(
         "--feature-grad-mult",
-        default=None,
         type=float,
+        metavar="D",
         help="reset feature grad mult in wav2vec 2.0 to this",
     )
-
     parser.add_argument(
         "--layerdrop",
-        default=0.0,
         type=float,
+        metavar="D",
         help="probability of dropping a layer in wav2vec 2.0",
     )
     parser.add_argument(
         "--max-positions",
         type=int,
+        metavar="N",
         help="Max input positions to be used in the conformer encoder in wav2vec 2.0",
     )
-
     parser.add_argument("--encoder-proj", action="store_true")
-
     parser.add_argument("--w2v-args", default=None)
-
     parser.add_argument(
         "--remove-weight-norm",
         action="store_true",
         help="if set, then the weight-norm (in one pos_conv layer) is removed from the model",
+    )
+    parser.add_argument(
+        "--encoder-embed-dim",
+        type=int,
+        metavar="N",
+        help="encoder embedding dimension to be used when w2v_path is None and no encoder_proj is set",
     )
 
 
@@ -425,9 +426,22 @@ def add_decoder_args(parser):
     parser.add_argument(
         "--layernorm-embedding", action="store_true", help="add layernorm to embedding"
     )
-    parser.add_argument("--decoder-layerdrop", type=float, metavar="D")
-    parser.add_argument("--decoder-learned-pos", action="store_true")
-    parser.add_argument("--share-decoder-input-output-embed", action="store_true")
+    parser.add_argument(
+        "--decoder-layerdrop",
+        type=float,
+        metavar="D",
+        help="layerdrop probability for decoder",
+    )
+    parser.add_argument(
+        "--decoder-learned-pos",
+        action="store_true",
+        help="learn positional embedding in decoder",
+    )
+    parser.add_argument(
+        "--share-decoder-input-output-embed",
+        action="store_true",
+        help="share decoder input and output embeddings",
+    )
     parser.add_argument(
         "--no-scale-embedding",
         action="store_true",
@@ -487,6 +501,10 @@ class XMTransformerModel(FairseqEncoderDecoderModel):
             "xm_transformer-21_en-xls_r_2b",
             "xm_transformer-en_15-xls_r_2b",
             "xm_transformer-22_16-xls_r_2b",
+            "xm_transformer_s2ut_800m-es-en-st-asr-bt_h1_2022",
+            "xm_transformer_s2ut_800m-en-es-st_plus_asr",
+            "xm_transformer_s2ut_800m-hk-en-h1_2022",
+            "xm_transformer_s2ut_800m-en-hk-h1_2022",
         ]
         return {i: f"{base_url}/{i}.tar.gz" for i in model_ids}
 
@@ -497,6 +515,8 @@ class XMTransformerModel(FairseqEncoderDecoderModel):
         checkpoint_file="model.pt",
         data_name_or_path=".",
         config_yaml="config.yaml",
+        task="speech_to_text",
+        generation_args=None,
         **kwargs,
     ):
         from fairseq import hub_utils
@@ -507,6 +527,8 @@ class XMTransformerModel(FairseqEncoderDecoderModel):
             data_name_or_path,
             archive_map=cls.hub_models(),
             config_yaml=config_yaml,
+            task=task,
+            generation_args=generation_args,
             **kwargs,
         )
         return S2THubInterface(x["args"], x["task"], x["models"][0])
@@ -521,7 +543,7 @@ class XMTransformerModel(FairseqEncoderDecoderModel):
         add_decoder_args(parser)
         parser.add_argument("--checkpoint-activations", action="store_true")
         parser.add_argument("--offload-activations", action="store_true")
-        parser.add_argument("--min-params-to-wrap", type=int)
+        parser.add_argument("--min-params-to-wrap", type=int, metavar="N")
 
     @classmethod
     def maybe_load_pretrained(cls, component, checkpoint: Optional[str] = None):
@@ -539,15 +561,20 @@ class XMTransformerModel(FairseqEncoderDecoderModel):
     def build_encoder(cls, args):
         _args = copy.deepcopy(args)
         if not args.adaptor_proj and not args.encoder_proj:  # V0 arch
-            state = checkpoint_utils.load_checkpoint_to_cpu(args.w2v_path)
-            if state.get("cfg") is not None:
-                encoder_embed_dim = state["cfg"]._content["model"]["encoder_embed_dim"]
-            elif state.get("args") is not None:
-                encoder_embed_dim = state["args"].encoder_embed_dim
+            if args.w2v_path:
+                state = checkpoint_utils.load_checkpoint_to_cpu(args.w2v_path)
+                if state.get("cfg") is not None:
+                    encoder_embed_dim = state["cfg"]._content["model"][
+                        "encoder_embed_dim"
+                    ]
+                elif state.get("args") is not None:
+                    encoder_embed_dim = state["args"].encoder_embed_dim
+                else:
+                    raise ValueError(f"Invalid config in {args.w2v_path}")
+                _args.decoder_embed_dim = encoder_embed_dim
+                del state
             else:
-                raise ValueError(f"Invalid config in {args.w2v_path}")
-            _args.decoder_embed_dim = encoder_embed_dim
-            del state
+                _args.decoder_embed_dim = args.encoder_embed_dim
 
         encoder = Wav2VecEncoderWithAdaptor(_args)
         encoder = cls.maybe_load_pretrained(
@@ -609,11 +636,6 @@ class XMTransformerModel(FairseqEncoderDecoderModel):
             ckpt = torch.load(getattr(args, "load_pretrained_decoder_from", None))
             decoder_args_dict = cls.get_decoder_args_from_checkpoint(ckpt["cfg"])
             args = cls.override_decoder_args(args, decoder_args_dict)
-
-        def build_embedding(dictionary, embed_dim):
-            num_embeddings = len(dictionary)
-            padding_idx = dictionary.pad()
-            return Embedding(num_embeddings, embed_dim, padding_idx)
 
         decoder_embed_tokens = build_embedding(
             task.target_dictionary, args.decoder_embed_dim
@@ -683,6 +705,7 @@ def set_default_w2v_encoder_args(args):
     args.normalize = getattr(args, "normalize", False)
     args.finetune_w2v_params = getattr(args, "finetune_w2v_params", "all")
     args.w2v_freezing_updates = getattr(args, "w2v_freezing_updates", None)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
 
 
 def set_default_adaptor_args(args):
